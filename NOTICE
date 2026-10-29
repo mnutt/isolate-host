@@ -1,0 +1,10 @@
+isolate-host
+
+The host implementation and embedding patches were extracted from Sandstorm's
+isolates-rebased work (host source copyright 2026 Sandstorm contributors),
+inspected through the capnp-es worktree at a35a0f04d. The extracted source is
+licensed under Apache-2.0. Original copyright notices are retained in source.
+
+The binary incorporates Cloudflare workerd and its dependencies. The workerd
+revision is pinned in upstream.json. Distribution archives include collected
+upstream license and notice files under licenses/.

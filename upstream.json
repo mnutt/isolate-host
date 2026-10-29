@@ -1,0 +1,8 @@
+{
+  "version": "0.1.0",
+  "protocolVersion": 1,
+  "sourceFormatVersion": 1,
+  "workerd": "ea5e86d22f16996a3d8fdb8922c34eb7e8711cd3",
+  "bazel": "9.1.0",
+  "bazelLinuxX86_64Sha256": "a667454f3f4f8878df8199136b82c199f6ada8477b337fae3b1ef854f01e4e2f"
+}
