@@ -7,54 +7,114 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
   linux-x86_64:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
+      - name: Verify release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          python3 - <<'PYTHON'
+          import json, os
+          version = json.load(open('upstream.json'))['version']
+          tag = os.environ['RELEASE_TAG']
+          if tag and tag != 'v' + version:
+              raise SystemExit(f'Tag {tag} does not match version {version}')
+          PYTHON
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build git patch python3 curl xz-utils unzip \
             libc++-19-dev libc++abi-19-dev libunwind-19-dev pkg-config zlib1g-dev
-      - name: Restore build downloads and actions
-        uses: actions/cache@v4
+      # The compiler is immutable and independent of source commits and apt updates.
+      - name: Restore pinned compiler
+        id: compiler-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/llvm
+          key: compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/toolchain.py') }}
+      - name: Install pinned compiler
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        run: python3 scripts/toolchain.py
+      - name: Save pinned compiler
+        if: steps.compiler-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/llvm
+          key: ${{ steps.compiler-cache.outputs.cache-primary-key }}
+      - name: Fingerprint Bazel toolchain
+        id: toolchain
+        run: |
+          python3 - <<'PYTHON'
+          import hashlib, json, os, pathlib, subprocess
+          pin = json.loads(pathlib.Path('upstream.json').read_text())
+          packages = subprocess.check_output(
+              ['dpkg-query', '-W', '-f=${Package}=${Version}\n'], text=True)
+          inputs = {
+              'imageOS': os.environ['ImageOS'],
+              'imageVersion': os.environ['ImageVersion'],
+              'packages': sorted(packages.splitlines()),
+              'compilerSha256': hashlib.sha256(
+                  pathlib.Path('build/llvm/bin/clang').read_bytes()).hexdigest(),
+              'compilerPinSha256': hashlib.sha256(
+                  pathlib.Path('scripts/toolchain.py').read_bytes()).hexdigest(),
+              'bazelVersion': pin['bazel'],
+              'bazelSha256': pin['bazelLinuxX86_64Sha256'],
+          }
+          encoded = json.dumps(inputs, sort_keys=True).encode()
+          fingerprint = hashlib.sha256(encoded).hexdigest()
+          pathlib.Path('build/toolchain-fingerprint.json').write_text(
+              json.dumps(inputs, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'hash={fingerprint}\n')
+          PYTHON
+      # Bazel hashes declared source inputs itself. Never restore action outputs
+      # across the toolchain boundary: system headers/libraries are external inputs.
+      - name: Restore Bazel caches
+        id: bazel-cache
+        uses: actions/cache/restore@v4
         with:
           path: |
-            build/llvm
             build/repository-cache
+            build/repo-contents-cache
             build/action-cache
-          key: host-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('upstream.json', 'scripts/toolchain.py') }}-${{ github.sha }}
+          key: bazel-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            host-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('upstream.json', 'scripts/toolchain.py') }}-
-      - name: Install pinned compiler
-        run: python3 scripts/toolchain.py
+            bazel-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-
       - name: Build and test
+        id: build
         run: |
           export CC="$PWD/build/llvm/bin/clang"
           export CXX="$PWD/build/llvm/bin/clang++"
           python3 scripts/build.py --test --jobs 4 \
             --bazel-option=--linkopt=/usr/lib/llvm-19/lib/libc++abi.a \
             --bazel-option=--host_linkopt=/usr/lib/llvm-19/lib/libc++abi.a
-      - name: Verify tag and package
-        env:
-          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          version = json.load(open('upstream.json'))['version']
-          tag = os.environ['RELEASE_TAG']
-          if tag and tag != 'v' + version:
-              raise SystemExit(f'Tag {tag} does not match version {version}')
-          PY
-          python3 scripts/package.py
+      # Keep successful compilation actions even if a later action or test fails.
+      # Each attempt saves a fresh immutable snapshot, including same-SHA retries.
+      - name: Save Bazel caches
+        if: always() && steps.bazel-cache.outcome == 'success' && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            build/repository-cache
+            build/repo-contents-cache
+            build/action-cache
+          key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
+      - name: Package Linux x86_64 release
+        run: python3 scripts/package.py
       - uses: actions/upload-artifact@v4
         with:
           name: isolate-host-linux-x86_64
           path: dist/
+          if-no-files-found: error
   publish:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: linux-x86_64
     runs-on: ubuntu-24.04
     permissions:
@@ -69,4 +129,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
-        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
+        working-directory: dist
+        run: |
+          sha256sum --check SHA256SUMS
+          gh release create "$RELEASE_TAG" \
+            isolate-host-*-linux-x86_64.tar.xz SHA256SUMS manifest.json \
+            --verify-tag --generate-notes

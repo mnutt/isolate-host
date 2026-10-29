@@ -103,6 +103,7 @@ def main():
     command += ['build',
                '--config=release', f'--jobs={args.jobs}',
                f'--repository_cache={build / "repository-cache"}',
+               f'--repo_contents_cache={build / "repo-contents-cache"}',
                f'--disk_cache={build / "action-cache"}', *args.bazel_option]
     if os.environ.get('CC'):
         command.append(f'--repo_env=CC={os.environ["CC"]}')

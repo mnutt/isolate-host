@@ -89,10 +89,23 @@ startup watchdog, and 180 s idle eviction. The watchdog is elapsed-time based.
 `ISOLATE_HOST_IDLE_TIMEOUT_MS` overrides the idle timeout (1 ms–24 hours),
 primarily for tests. See the source for all admission and message-size limits.
 
+## CI caching
+
+CI caches the pinned compiler separately from Bazel's download, repository-content,
+and action caches. Build-cache keys include the runner image, installed system
+package versions, compiler binary/pin, and Bazel version. Source changes reuse
+compatible caches; Bazel checks the declared inputs of individual actions.
+Each run attempt saves a fresh build-cache snapshot even when compilation or tests
+fail, so completed work is retained. Compiler installation is saved immediately.
+
 ## Releases
 
 Tags matching `v<version>` in `upstream.json` build, test, and publish releases to
 `https://github.com/mnutt/isolate-host`. No release is published by local scripts.
+Push a tag such as `v0.1.0` after setting the matching version in `upstream.json`.
+The tag is checked before building. On an Ubuntu 24.04 x86_64 runner, CI builds and
+tests the host, packages it, and publishes a GitHub Release only after those steps
+succeed. Branch/PR runs build and test without publishing a release.
 The workflow publishes:
 
 * `isolate-host-<version>-linux-x86_64.tar.xz`: executable, schemas, licenses,
