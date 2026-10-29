@@ -382,12 +382,29 @@ struct DecodedWorkerBundle final: public kj::AtomicRefcounted {
   kj::Array<DecodedBinding> bindings;
 };
 
+class NativeCapnpChannelEndpoint;
+
+// All operations run on the host event loop. Ownership may cross loader threads,
+// but cancellation and capability use remain on that event loop.
+struct WorkerLifetime final: public kj::AtomicRefcounted {
+  bool stopped = false;
+  kj::Canceler requests;
+  kj::HashSet<NativeCapnpChannelEndpoint*> nativeChannels;
+
+  void requireRunning() {
+    KJ_REQUIRE(!stopped, "worker has been stopped");
+  }
+  void stop();
+};
+
 struct SelfServiceTarget final: public kj::AtomicRefcounted {
   workerd::WorkerStubChannel* worker = nullptr;
+  kj::Own<WorkerLifetime> lifetime;
 };
 
 struct BundleBacking final: public kj::AtomicRefcounted {
   kj::Own<DecodedWorkerBundle> decoded;
+  kj::Own<WorkerLifetime> lifetime = kj::atomicRefcounted<WorkerLifetime>();
   capnp::MallocMessageBuilder compatibility;
   kj::Array<kj::Own<SelfServiceTarget>> selfServices;
 };
@@ -612,34 +629,60 @@ class NativeCapnpRpcSession final {
 class NativeCapnpChannelEndpoint final: public workerd::api::NativeByteChannelEndpoint {
  public:
   NativeCapnpChannelEndpoint(
-      kj::Own<NativeCapnpChannelState> state, kj::Own<NativeCapnpRpcSession> session)
-      : state(kj::mv(state)), session(kj::mv(session)) {}
-  ~NativeCapnpChannelEndpoint() noexcept override { state->close(); }
+      kj::Own<NativeCapnpChannelState> state, kj::Own<NativeCapnpRpcSession> session,
+      kj::Own<WorkerLifetime> lifetime)
+      : state(kj::mv(state)), session(kj::mv(session)), lifetime(kj::mv(lifetime)) {
+    this->lifetime->nativeChannels.insert(this);
+  }
+  ~NativeCapnpChannelEndpoint() noexcept override {
+    lifetime->nativeChannels.eraseMatch(this);
+    state->close();
+  }
 
   void send(kj::Array<kj::byte> message) override {
     state->send(true, kj::mv(message));
   }
   kj::Promise<kj::Array<kj::byte>> receive() override { return state->receive(true); }
-  void close() override { state->close(); }
+  void close() override {
+    state->close();
+    session = nullptr;
+  }
 
  private:
   kj::Own<NativeCapnpChannelState> state;
   kj::Own<NativeCapnpRpcSession> session;
+  kj::Own<WorkerLifetime> lifetime;
 };
+
+void WorkerLifetime::stop() {
+  if (stopped) return;
+  stopped = true;
+  // Closing a session can release other channels, so keep no iterators across it.
+  while (nativeChannels.size() > 0) {
+    auto channel = *nativeChannels.begin();
+    nativeChannels.eraseMatch(channel);
+    channel->close();
+  }
+  requests.cancel(KJ_EXCEPTION(DISCONNECTED, "worker stopped"));
+}
 
 class NativeCapnpChannelProvider final: public workerd::api::NativeByteChannelProvider {
  public:
-  explicit NativeCapnpChannelProvider(capnp::Capability::Client bootstrap)
-      : bootstrap(kj::mv(bootstrap)) {}
+  NativeCapnpChannelProvider(capnp::Capability::Client bootstrap,
+      kj::Own<WorkerLifetime> lifetime)
+      : bootstrap(kj::mv(bootstrap)), lifetime(kj::mv(lifetime)) {}
 
   kj::Own<workerd::api::NativeByteChannelEndpoint> open() override {
+    lifetime->requireRunning();
     auto state = kj::atomicRefcounted<NativeCapnpChannelState>();
     auto session = kj::heap<NativeCapnpRpcSession>(kj::atomicAddRef(*state), bootstrap);
-    return kj::heap<NativeCapnpChannelEndpoint>(kj::mv(state), kj::mv(session));
+    return kj::heap<NativeCapnpChannelEndpoint>(kj::mv(state), kj::mv(session),
+        kj::atomicAddRef(*lifetime));
   }
 
  private:
   capnp::Capability::Client bootstrap;
+  kj::Own<WorkerLifetime> lifetime;
 };
 
 class NativeCapnpChannelCapTableEntry final: public workerd::DynamicWorkerEnvCapability {
@@ -727,13 +770,15 @@ class WorkerIngressService final: public kj::HttpService {
     KJ_CONTEXT("dispatching hosted worker HTTP request", url);
     auto& worker = KJ_REQUIRE_NONNULL(target->worker,
         "hosted worker ingress used after worker eviction");
+    target->lifetime->requireRunning();
     auto ingress = worker.getEntrypoint(kj::none, workerd::Frankenvalue(), kj::none);
     auto normalizedUrl = url.startsWith("/")
         ? kj::str("http://worker.invalid", url)
         : kj::str(url);
     auto request = ingress->startRequest({});
-    return request->request(method, normalizedUrl, headers, requestBody, response)
-        .attach(kj::mv(request), kj::mv(ingress), kj::mv(normalizedUrl));
+    return target->lifetime->requests.wrap(
+        request->request(method, normalizedUrl, headers, requestBody, response)
+        .attach(kj::mv(request), kj::mv(ingress), kj::mv(normalizedUrl)));
   }
 
   kj::Promise<void> connect(kj::StringPtr host, const kj::HttpHeaders& headers,
@@ -741,10 +786,12 @@ class WorkerIngressService final: public kj::HttpService {
       kj::HttpConnectSettings settings) override {
     auto& worker = KJ_REQUIRE_NONNULL(target->worker,
         "hosted worker ingress used after worker eviction");
+    target->lifetime->requireRunning();
     auto ingress = worker.getEntrypoint(kj::none, workerd::Frankenvalue(), kj::none);
     auto request = ingress->startRequest({});
-    return request->connect(host, headers, connection, response, kj::mv(settings))
-        .attach(kj::mv(request), kj::mv(ingress));
+    return target->lifetime->requests.wrap(
+        request->connect(host, headers, connection, response, kj::mv(settings))
+        .attach(kj::mv(request), kj::mv(ingress)));
   }
 
  private:
@@ -762,10 +809,12 @@ class SelfBindingHttpService final: public SharedHttpService {
       kj::HttpService::Response& response) override {
     auto& worker = KJ_REQUIRE_NONNULL(target->worker,
         "worker-local service binding used after worker shutdown");
+    target->lifetime->requireRunning();
     auto ingress = worker.getEntrypoint(kj::none, workerd::Frankenvalue(), kj::none);
     auto request = ingress->startRequest({});
-    return request->request(method, url, headers, requestBody, response)
-        .attach(kj::mv(request), kj::mv(ingress));
+    return target->lifetime->requests.wrap(
+        request->request(method, url, headers, requestBody, response)
+        .attach(kj::mv(request), kj::mv(ingress)));
   }
 
  private:
@@ -992,26 +1041,18 @@ class CompatibleCapnpHttpService final: public SharedHttpService {
  public:
   CompatibleCapnpHttpService(capnp::ByteStreamFactory& streamFactory,
       kj::HttpHeaderTable& headerTable,
-      capnp::HttpService::Client service)
-      : streamFactory(streamFactory), headerTable(headerTable), service(kj::mv(service)) {}
+      capnp::HttpService::Client service, kj::Own<WorkerLifetime> lifetime)
+      : streamFactory(streamFactory), headerTable(headerTable), service(kj::mv(service)),
+        lifetime(kj::mv(lifetime)) {}
 
   kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url,
       const kj::HttpHeaders& headers, kj::AsyncInputStream& requestBody,
       kj::HttpService::Response& response) override {
+    lifetime->requireRunning();
     auto request = service.startRequestRequest();
     auto metadata = request.initRequest();
     metadata.setMethod(static_cast<capnp::HttpMethod>(method));
-    size_t pathStart = 0;
-    if (url.startsWith("http://"_kj)) pathStart = 7;
-    if (url.startsWith("https://"_kj)) pathStart = 8;
-    if (pathStart > 0) {
-      KJ_IF_SOME(slash, url.slice(pathStart).findFirst('/')) {
-        pathStart += slash;
-      } else {
-        pathStart = url.size();
-      }
-    }
-    metadata.setUrl(pathStart < url.size() ? url.slice(pathStart) : "/"_kj);
+    metadata.setUrl(url);
     encodeCompatibleHeaders(headers, metadata.initHeaders(headers.size()));
 
     bool hasBody = true;
@@ -1041,13 +1082,14 @@ class CompatibleCapnpHttpService final: public SharedHttpService {
     tasks.add(pipeline.getContext().whenResolved());
     tasks.add(kj::mv(responsePair.promise));
     tasks.add(kj::mv(requestBodyTask));
-    return kj::joinPromisesFailFast(tasks.finish());
+    return lifetime->requests.wrap(kj::joinPromisesFailFast(tasks.finish()));
   }
 
  private:
   capnp::ByteStreamFactory& streamFactory;
   kj::HttpHeaderTable& headerTable;
   capnp::HttpService::Client service;
+  kj::Own<WorkerLifetime> lifetime;
 };
 
 class CompatibleHttpRequestContext final:
@@ -1389,7 +1431,7 @@ LoadedWorkerSource buildWorkerSource(IsolateBindingServices::Client services,
             workerd::Frankenvalue::fromDirectCapability(
                 kj::refcounted<HttpServiceChannel>(
                     kj::refcounted<CompatibleCapnpHttpService>(streamFactory, headerTable,
-                        request.send().getService()))));
+                        request.send().getService(), kj::atomicAddRef(*backing->lifetime)))));
         break;
       }
       case IsolateWorkerSource::Binding::CAPNP: {
@@ -1399,11 +1441,12 @@ LoadedWorkerSource buildWorkerSource(IsolateBindingServices::Client services,
             workerd::Frankenvalue::fromDirectCapability(
                 kj::heap<NativeCapnpChannelCapTableEntry>(
                     kj::atomicRefcounted<NativeCapnpChannelProvider>(
-                        request.send().getBridge()))));
+                        request.send().getBridge(), kj::atomicAddRef(*backing->lifetime)))));
         break;
       }
       case IsolateWorkerSource::Binding::SERVICE: {
         auto target = kj::atomicRefcounted<SelfServiceTarget>();
+        target->lifetime = kj::atomicAddRef(*backing->lifetime);
         env.setProperty(kj::str(binding.name),
             workerd::Frankenvalue::fromDirectCapability(
                 kj::refcounted<HttpServiceChannel>(
@@ -1585,6 +1628,7 @@ struct HostedState final: public kj::Refcounted {
     if (!idleTimerCanceler.isEmpty()) {
       idleTimerCanceler.cancel("hosted isolate stopped");
     }
+    backing->lifetime->stop();
     runtime.evictDynamicWorker(LOADER_NAMESPACE, workerId);
     ingressTarget->worker = nullptr;
     revokeSelfServices();
@@ -1694,6 +1738,7 @@ class IsolateHostImpl final: public IsolateHost::Server, private kj::TaskSet::Er
       for (auto& target: backing->selfServices) target->worker = worker.get();
       auto ingressTarget = kj::atomicRefcounted<SelfServiceTarget>();
       ingressTarget->worker = worker.get();
+      ingressTarget->lifetime = kj::atomicAddRef(*backing->lifetime);
       auto state = kj::rc<HostedState>(runtime, kj::str(workerId),
           kj::mv(services), kj::mv(backing), kj::mv(worker), kj::mv(ingressTarget));
       refreshIdleTimer(state.addRef());

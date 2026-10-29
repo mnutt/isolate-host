@@ -23,9 +23,10 @@ public:
   TestStorageService(kj::HttpHeaderTable& headerTable, kj::String& stored)
       : headerTable(headerTable), stored(stored) {}
 
-  kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr,
+  kj::Promise<void> request(kj::HttpMethod method, kj::StringPtr url,
       const kj::HttpHeaders&, kj::AsyncInputStream& requestBody,
       kj::HttpService::Response& response) override {
+    if (url.endsWith("/url-test?q=1")) return send(response, url);
     if (method == kj::HttpMethod::PUT) {
       return requestBody.readAllText().then([this, &response](kj::String body) {
         stored = kj::mv(body);
@@ -69,6 +70,9 @@ public:
     return kj::READY_NOW;
   }
 
+public:
+  kj::StringPtr getStored() const { return stored; }
+
 private:
   capnp::ByteStreamFactory byteStreamFactory;
   kj::HttpHeaderTable::Builder headerTableBuilder;
@@ -106,6 +110,29 @@ int main(int argc, char** argv) {
 export default {
   async fetch(request, env) {
     console.log("isolate-host-log-marker");
+    if (new URL(request.url).pathname === "/url-test") {
+      return env.STORAGE.fetch("https://example.invalid:8443/url-test?q=1");
+    }
+    if (new URL(request.url).pathname === "/stop-stream") {
+      return new Response(new ReadableStream({ async start(c) {
+        // Keep a native session alive too, with receive() pending during stop.
+        const channel = env.ARBITRARY_RPC.open();
+        channel.send(BOOTSTRAP);
+        await channel.receive();
+        channel.receive().catch(() => {});
+        c.enqueue(new TextEncoder().encode("started"));
+        await new Promise(resolve => setTimeout(resolve, 300));
+        await env.STORAGE.fetch("http://storage/", {method: "PUT", body: "after-stop"});
+        c.enqueue(new TextEncoder().encode("finished"));
+        c.close();
+      }}));
+    }
+    if (new URL(request.url).pathname === "/websocket") {
+      const pair = new WebSocketPair();
+      pair[1].accept();
+      pair[1].addEventListener("message", e => pair[1].send(e.data));
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    }
     if (new URL(request.url).pathname === "/bridge-test") {
       const channel = env.ARBITRARY_RPC.open();
       channel.send(BOOTSTRAP);
@@ -204,8 +231,9 @@ export default { fetch() { return new Response("memory limit failed"); } };
   auto host = rpc.getMain<isolate_host::IsolateHost>();
   auto info = host.getInfoRequest().send().wait(waitScope);
   KJ_REQUIRE(info.getProtocolVersion() == 1 && info.getSourceFormatVersion() == 1);
-  isolate_host::IsolateBindingServices::Client services =
-      kj::heap<isolate_host::BindingServicesImpl>();
+  auto bindingServices = kj::heap<isolate_host::BindingServicesImpl>();
+  auto& bindingState = *bindingServices;
+  isolate_host::IsolateBindingServices::Client services = kj::mv(bindingServices);
 
   auto start = host.startWorkerRequest();
   start.setWorkerId("testgrain123");
@@ -295,6 +323,49 @@ export default { fetch() { return new Response("memory limit failed"); } };
     KJ_REQUIRE(body == (kj::StringPtr(path) == "bridge-test"
         ? "bridge-ok" : "hello:true:binary:ok"), body);
   }
+  {
+    kj::HttpHeaders headers(*headerTable);
+    auto request = httpClient->request(kj::HttpMethod::GET,
+        "https://worker.invalid/url-test", headers);
+    auto response = request.response.wait(waitScope);
+    KJ_REQUIRE(response.body->readAllText().wait(waitScope) ==
+        "https://example.invalid:8443/url-test?q=1", "binding URL was changed");
+  }
+  // Stop must cancel active streams, including native channels opened by them,
+  // and prevent delayed storage writes. A replacement can safely reuse the ID.
+  for (auto route: {"stop-stream", "websocket"}) {
+    auto start = host.startWorkerRequest();
+    start.setWorkerId("stop-probe");
+    start.setServices(services);
+    start.setWorkerSource(sourceBytes);
+    auto worker = start.send().wait(waitScope).getWorker();
+    auto http = worker.getHttpServiceRequest().send().wait(waitScope);
+    auto service = httpFactory.capnpToKj(http.getService());
+    auto client = kj::newHttpClient(*service);
+    kj::HttpHeaders headers(*headerTable);
+    if (kj::StringPtr(route) == "stop-stream") {
+      auto request = client->request(kj::HttpMethod::GET,
+          "https://worker.invalid/stop-stream", headers);
+      auto response = request.response.wait(waitScope);
+      char prefix[7];
+      response.body->read(prefix, 7, 7).wait(waitScope);
+      worker.stopRequest().send().wait(waitScope);
+      isolate_host::expectFailure([&]() { response.body->readAllText().wait(waitScope); });
+    } else {
+      auto response = client->openWebSocket("https://worker.invalid/websocket", headers)
+          .wait(waitScope);
+      KJ_REQUIRE(response.statusCode == 101);
+      auto& socket = response.webSocketOrBody.get<kj::Own<kj::WebSocket>>();
+      socket->send("echo"_kj).wait(waitScope);
+      auto echo = socket->receive().wait(waitScope);
+      KJ_REQUIRE(echo.get<kj::String>() == "echo");
+      worker.stopRequest().send().wait(waitScope);
+      isolate_host::expectFailure([&]() { socket->receive().wait(waitScope); });
+    }
+  }
+  rpc.getIoProvider().getTimer().afterDelay(400 * kj::MILLISECONDS).wait(waitScope);
+  KJ_REQUIRE(bindingState.getStored() == "shared-storage-ok",
+      "stopped worker performed a delayed storage write");
   // IDs have no filesystem meaning; retain the same running worker for any opaque ID.
   auto opaque = host.startWorkerRequest();
   opaque.setWorkerId("a/b");

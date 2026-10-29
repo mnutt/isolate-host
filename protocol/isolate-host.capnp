@@ -14,6 +14,7 @@ interface IsolateHost @0xdcdaa5a88a3fd342 {
 
 interface IsolateBindingServices @0xa729f6e28d4b02ed {
   getService @0 (name :Text) -> (service :Http.HttpService);
+  # Requests preserve the URL supplied by workerd, including scheme and authority.
   getBridge @1 (name :Text) -> (bridge :Capability);
   # Named capabilities are scoped to this worker. A bridge is an opaque Cap'n Proto
   # bootstrap exposed through a bounded native byte channel, without FD passing.
@@ -24,5 +25,7 @@ interface HostedIsolate @0xe07a19005d5be30c {
   stop @1 ();
   getHttpService @2 () -> (service :Http.HttpService);
   # Ingress authority comes from possession of this capability, not a worker ID.
-  # Stop/idle eviction invalidates existing ingress and worker-local services.
+  # Stop/idle eviction invalidates existing ingress and worker-local services,
+  # cancels host HTTP operations, and closes native channels. It does not roll back
+  # side effects already accepted by remote services.
 }

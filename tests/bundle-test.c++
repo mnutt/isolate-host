@@ -52,5 +52,21 @@ int main() {
   source.setMainModule("main.js");
   bindings[1].setJson(kj::StringPtr("{invalid}").asBytes());
   expectFailure([&]() { decode(source); });
-  puts("bundle validation passed");
+  // Native sessions have their own lifetime, even without an active HTTP request.
+  {
+    kj::EventLoop loop;
+    kj::WaitScope waitScope(loop);
+    auto lifetime = kj::atomicRefcounted<WorkerLifetime>();
+    auto provider = kj::atomicRefcounted<NativeCapnpChannelProvider>(
+        capnp::Capability::Client(nullptr), kj::atomicAddRef(*lifetime));
+    auto channel = provider->open();
+    auto receive = channel->receive();
+    lifetime->stop();
+    expectFailure([&]() { receive.wait(waitScope); });
+    expectFailure([&]() { channel->send(kj::heapArray<kj::byte>(8)); });
+    expectFailure([&]() { provider->open(); });
+    channel->close();
+    lifetime->stop();  // Repeated stop and close remain harmless.
+  }
+  puts("bundle and native lifetime validation passed");
 }

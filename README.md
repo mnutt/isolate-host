@@ -64,7 +64,8 @@ The public schemas are in `protocol/`:
 * `startWorker(workerId, services, workerSource)` creates or retains a worker.
   IDs are opaque, nonempty, at most 256 bytes, and never used as paths. Starting
   an already-running ID retains its original source and capabilities; call
-  `stop()` before replacing it.
+  `stop()` before replacing it. Stop cancels active host HTTP operations and closes
+  native sessions; it does not roll back effects already accepted by remote services.
 * `workerSource` is a **packed** `IsolateWorkerSource` message. It includes the
   main module, compatibility date/flags, modules, and named bindings.
 * Bindings support text, bytes, JSON, HTTP services, native Cap'n Proto
@@ -80,8 +81,9 @@ The public schemas are in `protocol/`:
 
 Supply only capabilities already confined to the intended worker. The native
 bridge is opaque to the host, and does not transmit file descriptors. Module
-names are passed through without Sandstorm-specific aliases. Global outbound
-network access is not configured; workers access supplied service bindings.
+names are passed through without Sandstorm-specific aliases. HTTP service bindings
+preserve the full URL; path-only routing belongs in the supplied service adapter.
+Global outbound network access is not configured; workers access supplied service bindings.
 
 Current fixed policy includes 64 MiB old/16 MiB young V8 heap limits, 16 MiB
 worker bundles, 64 subrequests, a 250 ms JavaScript watchdog per request, a 5 s
