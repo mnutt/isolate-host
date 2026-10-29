@@ -29,6 +29,8 @@
 #include <kj/thread.h>
 
 #include <sys/random.h>
+#include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -57,6 +59,12 @@ constexpr auto REQUEST_JS_LIMIT = std::chrono::milliseconds(250);
 constexpr auto STARTUP_JS_LIMIT = std::chrono::seconds(5);
 constexpr auto DEFAULT_IDLE_TIMEOUT = 180 * kj::SECONDS;
 
+int64_t readCpuNanos(clockid_t clock) {
+  timespec value;
+  KJ_SYSCALL(clock_gettime(clock, &value));
+  return int64_t(value.tv_sec) * 1000000000 + value.tv_nsec;
+}
+
 class JsWatchdogScheduler final {
  public:
   JsWatchdogScheduler(): thread([this]() { run(); }) {}
@@ -72,10 +80,17 @@ class JsWatchdogScheduler final {
 
   uint64_t schedule(v8::Isolate& isolate,
       std::atomic<bool>& exceeded,
-      std::chrono::steady_clock::time_point deadline) {
+      std::chrono::nanoseconds budget,
+      kj::CrossThreadPromiseFulfiller<void>* limitFulfiller) {
+    clockid_t cpuClock;
+    KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &cpuClock) == 0);
+    // Wake on wall time, but only charge CPU consumed by the JavaScript thread.
+    // A busy host may deschedule that thread while its isolate lock is held.
+    auto cpuDeadline = readCpuNanos(cpuClock) + budget.count();
+    auto deadline = std::chrono::steady_clock::now() + budget;
     std::lock_guard lock(mutex);
     auto id = nextId++;
-    entries.push_back(Entry{ id, deadline, &isolate, &exceeded });
+    entries.push_back(Entry{ id, deadline, &isolate, &exceeded, cpuClock, cpuDeadline, limitFulfiller });
     wake.notify_one();
     return id;
   }
@@ -98,6 +113,9 @@ class JsWatchdogScheduler final {
     std::chrono::steady_clock::time_point deadline;
     v8::Isolate* isolate;
     std::atomic<bool>* exceeded;
+    clockid_t cpuClock;
+    int64_t cpuDeadline;
+    kj::CrossThreadPromiseFulfiller<void>* limitFulfiller;
   };
 
   std::mutex mutex;
@@ -127,8 +145,18 @@ class JsWatchdogScheduler final {
         if (entry.deadline > now) continue;
         // Keep the scheduler lock while touching the registered pointers. cancel() therefore does
         // not return until a concurrent timeout is finished, so scope destruction is race-free.
+        auto remaining = entry.cpuDeadline - readCpuNanos(entry.cpuClock);
+        if (remaining > 0) {
+          entry.deadline = now + std::chrono::nanoseconds(remaining);
+          continue;
+        }
         entry.exceeded->store(true, std::memory_order_release);
         entry.isolate->TerminateExecution();
+        if (entry.limitFulfiller != nullptr) {
+          // Terminating V8 does not settle pending asynchronous response/body promises.
+          // Notify IoContext as well so the request is aborted instead of waiting for idle eviction.
+          entry.limitFulfiller->reject(KJ_EXCEPTION(OVERLOADED, "CPU limit exceeded"));
+        }
         entry = entries.back();
         entries.pop_back();
       }
@@ -141,28 +169,27 @@ class JsWatchdogScope final {
   JsWatchdogScope(JsWatchdogScheduler& scheduler,
       v8::Isolate& isolate,
       std::atomic<int64_t>& remainingNanos,
-      std::atomic<bool>& exceeded)
+      std::atomic<bool>& exceeded,
+      kj::CrossThreadPromiseFulfiller<void>* limitFulfiller = nullptr)
       : scheduler(scheduler),
         remainingNanos(remainingNanos),
-        started(std::chrono::steady_clock::now()) {
+        started(readCpuNanos(CLOCK_THREAD_CPUTIME_ID)) {
     auto budget = std::chrono::nanoseconds(
         kj::max<int64_t>(0, remainingNanos.load(std::memory_order_relaxed)));
-    registration = scheduler.schedule(isolate, exceeded, started + budget);
+    registration = scheduler.schedule(isolate, exceeded, budget, limitFulfiller);
   }
 
   ~JsWatchdogScope() noexcept {
     scheduler.cancel(registration);
 
-    auto elapsed = std::chrono::steady_clock::now() - started;
-    remainingNanos.fetch_sub(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count(),
-        std::memory_order_relaxed);
+    auto elapsed = readCpuNanos(CLOCK_THREAD_CPUTIME_ID) - started;
+    remainingNanos.fetch_sub(elapsed, std::memory_order_relaxed);
   }
 
  private:
   JsWatchdogScheduler& scheduler;
   std::atomic<int64_t>& remainingNanos;
-  std::chrono::steady_clock::time_point started;
+  int64_t started;
   uint64_t registration;
 };
 
@@ -274,11 +301,16 @@ class HostRequestLimitEnforcer final: public workerd::LimitEnforcer {
  public:
   HostRequestLimitEnforcer(kj::Timer& timer, JsWatchdogScheduler& watchdogs)
       : timer(timer), watchdogs(watchdogs), remainingNanos(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(REQUEST_JS_LIMIT).count()) {}
+          std::chrono::duration_cast<std::chrono::nanoseconds>(REQUEST_JS_LIMIT).count()) {
+    auto failure = kj::newPromiseAndCrossThreadFulfiller<void>();
+    limitFulfiller = kj::mv(failure.fulfiller);
+    limitPromise = failure.promise.fork();
+  }
 
   kj::Own<void> enterJs(workerd::jsg::Lock& lock, workerd::IoContext&) override {
     requireLimitsNotExceeded();
-    return kj::heap<JsWatchdogScope>(watchdogs, *lock.v8Isolate, remainingNanos, exceeded);
+    return kj::heap<JsWatchdogScope>(
+        watchdogs, *lock.v8Isolate, remainingNanos, exceeded, limitFulfiller.get());
   }
   void topUpActor() override {}
   void newSubrequest(bool) override {
@@ -295,7 +327,7 @@ class HostRequestLimitEnforcer final: public workerd::LimitEnforcer {
     if (exceeded.load(std::memory_order_acquire)) return workerd::EventOutcome::EXCEEDED_CPU;
     return kj::none;
   }
-  kj::Promise<void> onLimitsExceeded() override { return kj::NEVER_DONE; }
+  kj::Promise<void> onLimitsExceeded() override { return limitPromise.addBranch(); }
   void setCpuLimitNearlyExceededCallback(kj::Function<void(void)>) override {}
   void requireLimitsNotExceeded() override {
     JSG_REQUIRE(!exceeded.load(std::memory_order_acquire), Error, "CPU limit exceeded");
@@ -310,6 +342,8 @@ class HostRequestLimitEnforcer final: public workerd::LimitEnforcer {
   std::atomic<int64_t> remainingNanos;
   std::atomic<bool> exceeded = false;
   std::atomic<uint> subrequests = 0;
+  kj::Own<kj::CrossThreadPromiseFulfiller<void>> limitFulfiller;
+  kj::ForkedPromise<void> limitPromise = nullptr;
 };
 
 class HostLimitEnforcerFactory final:

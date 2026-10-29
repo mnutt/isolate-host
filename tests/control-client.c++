@@ -145,6 +145,13 @@ export default {
       return new Response(env.MESSAGE + ":" + env.SETTINGS.enabled + ":" +
         new TextDecoder().decode(env.BYTES) + ":" + await own.text());
     }
+    if (new URL(request.url).pathname === "/cpu-stream") {
+      return new Response(new ReadableStream({ async start(controller) {
+        controller.enqueue(new TextEncoder().encode("started"));
+        await new Promise(resolve => setTimeout(resolve, 10));
+        while (true) {}
+      }}));
+    }
     if (new URL(request.url).pathname === "/cpu-loop") {
       while (true) {}
     }
@@ -373,6 +380,33 @@ export default { fetch() { return new Response("memory limit failed"); } };
   opaque.setWorkerSource(sourceBytes);
   auto opaqueWorker = opaque.send().wait(waitScope).getWorker();
   opaqueWorker.stopRequest().send().wait(waitScope);
+  // Exceeding the limit after response headers must abort the pending body read.
+  // Terminating V8 alone leaves this read hanging until worker idle eviction.
+  {
+    auto start = host.startWorkerRequest();
+    start.setWorkerId("cpustreamgrain123");
+    start.setServices(services);
+    start.setWorkerSource(sourceBytes);
+    auto worker = start.send().wait(waitScope).getWorker();
+    auto http = worker.getHttpServiceRequest().send().wait(waitScope);
+    auto service = httpFactory.capnpToKj(http.getService());
+    auto client = kj::newHttpClient(*service);
+    kj::HttpHeaders headers(*headerTable);
+    auto request = client->request(kj::HttpMethod::GET,
+        "https://grain.invalid/cpu-stream", headers);
+    auto response = request.response.wait(waitScope);
+    KJ_REQUIRE(response.statusCode == 200);
+    auto& timer = rpc.getIoProvider().getTimer();
+    auto started = timer.now();
+    auto failure = kj::runCatchingExceptions([&]() {
+      timer.timeoutAfter(5 * kj::SECONDS, response.body->readAllText()).wait(waitScope);
+    });
+    KJ_REQUIRE(failure != nullptr, "CPU-limited streaming response unexpectedly completed");
+    KJ_REQUIRE(timer.now() - started < 5 * kj::SECONDS,
+        "CPU-limited streaming response hung instead of aborting");
+    worker.stopRequest().send().wait(waitScope);
+  }
+
   auto cpuStart = host.startWorkerRequest();
   cpuStart.setWorkerId("cpugrain123");
   cpuStart.setServices(services);
