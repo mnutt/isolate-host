@@ -121,6 +121,11 @@ client bindings; they do not need Bazel, workerd, V8, or this compiler toolchain
 The release binary is dynamically linked to the Linux C runtime. Check the
 manifest's glibc requirement and test under the consumer's actual sandbox.
 
+The Abseil overlay handles `EPERM` and `ENOSYS` from scheduling-priority queries
+by retaining the thread's cached priority and disabling further queries for that
+thread. This avoids repeated mutex diagnostics on existing Sandstorm servers
+whose grain sandbox denies these queries. Other errors retain their diagnostics.
+
 The protocol is new and intentionally incompatible with Sandstorm's private
 `startGrain` interface. This is not a drop-in binary replacement until the
 consumer adopts these schemas.

@@ -38,3 +38,25 @@ Local smoke binaries/archives under `build/` use the machine's glibc 2.44 and ar
 not published release artifacts. The Ubuntu 24.04 workflow builds the distribution
 binary and records its actual minimum glibc version in the release manifest.
 No GitHub repository or release was created by this extraction.
+
+## Sandboxed scheduling-priority regression
+
+Validated on 2026-11-09: the updated overlay applies to the pinned workerd source
+with zero fuzz, and its nested patch applies to Abseil 20260107.1. Built the real
+patched Abseil synchronization library and ran four mutex enqueue tests with
+`pthread_getschedparam` intercepted at link time. Successful queries are cached;
+`EPERM` and `ENOSYS` each cause exactly one probe and no diagnostic across repeated
+waits; `ESRCH` still produces diagnostics and retries. All four tests passed.
+This check does not rebuild the full host or run a grain on a deployed server.
+
+To repeat, prepare the workerd overlay with `scripts/build.py --prepare-only`,
+then use a disposable copy of the pinned Abseil source:
+
+```sh
+patch --batch --fuzz=0 -p1 -d /absolute/path/to/abseil-copy \
+  -i "$PWD/build/workerd/patches/abseil-sandbox-priority.patch"
+cmake -S tests/abseil-priority -B build/abseil-priority-test \
+  -DABSEIL_SOURCE=/absolute/path/to/abseil-copy -DCMAKE_BUILD_TYPE=Release
+cmake --build build/abseil-priority-test -j4
+ctest --test-dir build/abseil-priority-test --output-on-failure
+```
