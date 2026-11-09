@@ -93,12 +93,17 @@ primarily for tests. See the source for all admission and message-size limits.
 
 ## CI caching
 
-CI caches the pinned compiler separately from Bazel's download, repository-content,
-and action caches. Build-cache keys include the runner image, installed system
-package versions, compiler binary/pin, and Bazel version. Source changes reuse
-compatible caches; Bazel checks the declared inputs of individual actions.
-Each run attempt saves a fresh build-cache snapshot even when compilation or tests
-fail, so completed work is retained. Compiler installation is saved immediately.
+CI caches the pinned compiler, downloaded dependencies, and native build outputs
+separately. Downloads can be reused across toolchain changes. Native build-cache
+keys include the runner OS, native system headers/libraries and linker packages,
+compiler binary/pin, and Bazel version. Runner image version changes and unrelated
+installed packages do not invalidate these caches. Repository-content caches stay
+with native outputs because they may contain generated or toolchain-dependent files.
+Source changes reuse compatible caches; Bazel checks the declared inputs of
+individual actions. Each run attempt saves fresh download and native-cache
+snapshots even when compilation or tests fail. Compiler installation is saved
+immediately. GitHub repository cache retention is set to 30 days with a 10 GB
+storage cap; size-based eviction can still remove caches earlier.
 
 ## Releases
 

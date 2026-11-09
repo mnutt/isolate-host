@@ -52,14 +52,23 @@ jobs:
         id: toolchain
         run: |
           python3 - <<'PYTHON'
-          import hashlib, json, os, pathlib, subprocess
+          import fnmatch, hashlib, json, os, pathlib, subprocess
           pin = json.loads(pathlib.Path('upstream.json').read_text())
           packages = subprocess.check_output(
               ['dpkg-query', '-W', '-f=${Package}=${Version}\n'], text=True)
+          # Only system inputs used by native compilation/linking belong here.
+          # Runner image releases and unrelated installed tools do not.
+          patterns = ['libc6', 'libc6-dev', 'linux-libc-dev', 'libc++*',
+                      'libunwind*', 'libgcc*', 'libstdc++*', 'binutils*',
+                      'zlib1g', 'zlib1g-dev']
+          native_packages = sorted(line for line in packages.splitlines()
+              if any(fnmatch.fnmatchcase(line.split('=', 1)[0], pattern)
+                     for pattern in patterns))
+          if not native_packages:
+              raise SystemExit('No native toolchain packages found')
           inputs = {
               'imageOS': os.environ['ImageOS'],
-              'imageVersion': os.environ['ImageVersion'],
-              'packages': sorted(packages.splitlines()),
+              'packages': native_packages,
               'compilerSha256': hashlib.sha256(
                   pathlib.Path('build/llvm/bin/clang').read_bytes()).hexdigest(),
               'compilerPinSha256': hashlib.sha256(
@@ -69,24 +78,50 @@ jobs:
           }
           encoded = json.dumps(inputs, sort_keys=True).encode()
           fingerprint = hashlib.sha256(encoded).hexdigest()
+          # Migrate existing combined caches only for the exact old environment.
+          legacy_inputs = dict(inputs, imageVersion=os.environ['ImageVersion'],
+                               packages=sorted(packages.splitlines()))
+          legacy_hash = hashlib.sha256(
+              json.dumps(legacy_inputs, sort_keys=True).encode()).hexdigest()
           pathlib.Path('build/toolchain-fingerprint.json').write_text(
               json.dumps(inputs, indent=2) + '\n')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write(f'hash={fingerprint}\n')
+              output.write(f'legacy-hash={legacy_hash}\n')
           PYTHON
       # Bazel hashes declared source inputs itself. Never restore action outputs
       # across the toolchain boundary: system headers/libraries are external inputs.
+      - name: Restore Bazel downloads
+        id: bazel-downloads
+        uses: actions/cache/restore@v4
+        with:
+          path: build/repository-cache
+          key: bazel-downloads-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bazel-downloads-v1-${{ runner.os }}-${{ runner.arch }}-
+      # Repository contents may include generated/toolchain-dependent files.
+      # Keep them with action outputs under the native toolchain fingerprint.
       - name: Restore Bazel caches
         id: bazel-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/repo-contents-cache
+            build/action-cache
+          key: bazel-native-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bazel-native-v3-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-
+      - name: Restore legacy combined cache
+        if: steps.bazel-cache.outputs.cache-matched-key == ''
         uses: actions/cache/restore@v4
         with:
           path: |
             build/repository-cache
             build/repo-contents-cache
             build/action-cache
-          key: bazel-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: bazel-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.legacy-hash }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
-            bazel-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.hash }}-
+            bazel-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.legacy-hash }}-
       - name: Build and test
         id: build
         run: |
@@ -97,12 +132,17 @@ jobs:
             --bazel-option=--host_linkopt=/usr/lib/llvm-19/lib/libc++abi.a
       # Keep successful compilation actions even if a later action or test fails.
       # Each attempt saves a fresh immutable snapshot, including same-SHA retries.
+      - name: Save Bazel downloads
+        if: always() && steps.bazel-downloads.outcome == 'success' && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v4
+        with:
+          path: build/repository-cache
+          key: ${{ steps.bazel-downloads.outputs.cache-primary-key }}
       - name: Save Bazel caches
         if: always() && steps.bazel-cache.outcome == 'success' && steps.build.outcome != 'skipped'
         uses: actions/cache/save@v4
         with:
           path: |
-            build/repository-cache
             build/repo-contents-cache
             build/action-cache
           key: ${{ steps.bazel-cache.outputs.cache-primary-key }}
